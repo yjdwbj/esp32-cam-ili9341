@@ -1,3 +1,6 @@
 [submodule "components/esp32-camera"]
 	path = components/esp32-camera
 	url = https://github.com/espressif/esp32-camera
+[submodule "components/idf-extra-components"]
+	path = components/idf-extra-components
+	url = https://github.com/espressif/idf-extra-components

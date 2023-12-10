@@ -71,6 +71,14 @@ typedef struct
 #endif
 
 static const char *TAG = "esp32_cam:http_jpg";
+#define LCD_H_RES (320)
+#define LCD_V_RES (240)
+#define LCD_BIT_PER_PIXEL (16)
+#define ESP_CAMERA_SUPPORTED 1
+
+uint8_t *_jpg_buf = NULL;
+size_t _jpg_buf_len = 0;
+volatile uint32_t _jpg_frame_number = 0;
 
 #ifdef USE_ILI9341_DRIVER
 #include "driver/spi_master.h"
@@ -78,12 +86,10 @@ static const char *TAG = "esp32_cam:http_jpg";
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "lcd_ili9341.h"
+#include "decode_image.h"
 #endif
 
-#define LCD_H_RES (320)
-#define LCD_V_RES (240)
-#define LCD_BIT_PER_PIXEL (16)
-#define ESP_CAMERA_SUPPORTED 1
+
 
 // ESP32Cam (AiThinker) PIN Map
 
@@ -98,23 +104,23 @@ static const char *TAG = "esp32_cam:http_jpg";
 #define TFT_LCD_RST     (2)
 #define TFT_LCD_BL      (-1) // High level is valid connect to VCC
 
-#define CAM_PIN_PWDN 32
-#define CAM_PIN_RESET -1 // software reset will be performed
-#define CAM_PIN_XCLK 0
-#define CAM_PIN_SIOD 26
-#define CAM_PIN_SIOC 27
+#define CAM_PIN_PWDN    32
+#define CAM_PIN_RESET   -1 // software reset will be performed
+#define CAM_PIN_XCLK    0
+#define CAM_PIN_SIOD    26
+#define CAM_PIN_SIOC    27
 
-#define CAM_PIN_D7 35
-#define CAM_PIN_D6 34
-#define CAM_PIN_D5 39
-#define CAM_PIN_D4 36
-#define CAM_PIN_D3 21
-#define CAM_PIN_D2 19
-#define CAM_PIN_D1 18
-#define CAM_PIN_D0 5
-#define CAM_PIN_VSYNC 25
-#define CAM_PIN_HREF 23
-#define CAM_PIN_PCLK 22
+#define CAM_PIN_D7      35
+#define CAM_PIN_D6      34
+#define CAM_PIN_D5      39
+#define CAM_PIN_D4      36
+#define CAM_PIN_D3      21
+#define CAM_PIN_D2      19
+#define CAM_PIN_D1      18
+#define CAM_PIN_D0      5
+#define CAM_PIN_VSYNC   25
+#define CAM_PIN_HREF    23
+#define CAM_PIN_PCLK    22
 
 #endif
 
@@ -150,6 +156,7 @@ static const char *TAG = "esp32_cam:http_jpg";
 
 #ifdef USE_ILI9341_DRIVER
 static esp_lcd_panel_handle_t panel_handle = NULL;
+
 static void inital_lcd() {
 
 #if TFT_LCD_BL >= 0
@@ -163,14 +170,33 @@ static void inital_lcd() {
     gpio_config(&io_conf);
     gpio_set_level(TFT_LCD_BL, 1);
 #endif
-    const spi_bus_config_t buscfg = ILI9341_PANEL_BUS_SPI_CONFIG(TFT_LCD_SCK, TFT_LCD_MOSI,
-                                                                 LCD_H_RES * 80 * LCD_BIT_PER_PIXEL / 8);
-    spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    const spi_bus_config_t buscfg = {
+        .sclk_io_num = TFT_LCD_SCK,
+        .mosi_io_num = TFT_LCD_MOSI,
+        .miso_io_num = -1,
+        .quadhd_io_num = -1,
+        .quadwp_io_num = -1,
+        // The max_transfer_sz value will occur the below error when it over 8192.
+        // E (14337) lcd_panel.io.spi: panel_io_spi_tx_color(387): spi transmit (queue) color failed
+        .max_transfer_sz = 8192,
+    };
+
+    spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH1);
 
     // ESP_LOGI(TAG, "Install panel IO");
     esp_lcd_panel_io_handle_t io_handle = NULL;
-    const esp_lcd_panel_io_spi_config_t io_config = ILI9341_PANEL_IO_SPI_CONFIG(TFT_LCD_CS, TFT_LCD_DC,
-                                                                                NULL, NULL);
+    const esp_lcd_panel_io_spi_config_t io_config = {                                                               \
+        .cs_gpio_num = TFT_LCD_CS,
+        .dc_gpio_num = TFT_LCD_DC,
+        .spi_mode = 0,
+        .pclk_hz = 40 * 1000 * 1000,
+        .trans_queue_depth = 10,
+        .on_color_trans_done = NULL,
+        .user_ctx = NULL,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+    };
+
     // Attach the LCD to the SPI bus
     esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle);
 
@@ -197,13 +223,74 @@ static void inital_lcd() {
 #if CONFIG_EXAMPLE_LCD_TOUCH_ENABLED
 esp_lcd_touch_handle_t tp = NULL;
 #endif
+
+#define PARALLEL_LINES  (16)
+#define ROTATE_FRAME  (30)
+
+static uint16_t *s_lines[2];
+
+uint16_t *pixels;
+
+// Grab a rgb16 pixel from the esp32_tiles image
+static inline uint16_t get_bgnd_pixel(int x, int y) {
+    // Get color of the pixel on x,y coords
+    return (uint16_t) * (pixels + (y * IMAGE_W) + x);
+}
+
+// Instead of calculating the offsets for each pixel we grab, we pre-calculate the valueswhenever a frame changes, then re-use
+// these as we go through all the pixels in the frame. This is much, much faster.
+static int8_t xofs[320], yofs[240];
+static int8_t xcomp[320], ycomp[240];
+
+// Calculate the pixel data for a set of lines (with implied line size of 320). Pixels go in dest, line is the Y-coordinate of the
+// first line to be calculated, linect is the amount of lines to calculate. Frame increases by one every time the entire image
+// is displayed; this is used to go to the next frame of animation.
+void pretty_effect_calc_lines(uint16_t *dest, int line, int linect) {
+    for (int y = line; y < line + linect; y++) {
+        for (int x = 0; x < 320; x++) {
+            *dest++ = get_bgnd_pixel(x + yofs[y] + xcomp[x], y + xofs[x] + ycomp[y]);
+        }
+    }
+}
+
+static void display_pretty_colors(esp_lcd_panel_handle_t panel_handle) {
+    // Indexes of the line currently being sent to the LCD and the line we're calculating
+    int sending_line = 0;
+    int calc_line = 0;
+
+    // After ROTATE_FRAME frames, the image will be rotated
+    for (int y = 0; y < LCD_V_RES; y += PARALLEL_LINES) {
+        // Calculate a line
+        pretty_effect_calc_lines(s_lines[calc_line], y, PARALLEL_LINES);
+        sending_line = calc_line;
+        calc_line = !calc_line;
+        // Send the calculated data
+        esp_lcd_panel_draw_bitmap(panel_handle, 0, y, 0 + LCD_H_RES, y + PARALLEL_LINES, s_lines[sending_line]);
+    }
+}
+
+static void tftlcd_task(void)
+{
+    static camera_fb_t *pic = NULL;
+    while (1) {
+        pic = esp_camera_fb_get();
+        _jpg_buf = pic->buf;
+        _jpg_buf_len = pic->len;
+        _jpg_frame_number++;
+        decode_image(&pixels, pic);
+        display_pretty_colors(panel_handle);
+        esp_camera_fb_return(pic);
+        free(pixels);
+        vTaskDelay(pdMS_TO_TICKS(33));
+    }
+}
 #endif
 
 #if ESP_CAMERA_SUPPORTED
 static camera_config_t camera_config = {
-    .pin_pwdn = CAM_PIN_PWDN,
-    .pin_reset = CAM_PIN_RESET,
-    .pin_xclk = CAM_PIN_XCLK,
+    .pin_pwdn   = CAM_PIN_PWDN,
+    .pin_reset  = CAM_PIN_RESET,
+    .pin_xclk   = CAM_PIN_XCLK,
     .pin_sccb_sda = CAM_PIN_SIOD,
     .pin_sccb_scl = CAM_PIN_SIOC,
 
@@ -223,10 +310,10 @@ static camera_config_t camera_config = {
     .xclk_freq_hz = 24000000,
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
-    .pixel_format = PIXFORMAT_RGB565, // YUV422,GRAYSCALE,RGB565,JPEG
+    .pixel_format = PIXFORMAT_JPEG, // YUV422,GRAYSCALE,RGB565,JPEG
     .frame_size = FRAMESIZE_QVGA,     // QQVGA-UXGA, For ESP32, do not use sizes above QVGA when not JPEG. The performance of the ESP32-S series has improved a lot, but JPEG mode always gives better frame rates.
 
-    .jpeg_quality = 12, // 0-63, for OV series camera sensors, lower number means higher quality
+    .jpeg_quality = 16, // 0-63, for OV series camera sensors, lower number means higher quality
     .fb_count = 1,      // When jpeg mode is used, if fb_count more than one, the driver will work in continuous mode.
     .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
 };
@@ -245,44 +332,57 @@ static esp_err_t init_camera(void) {
 
 #if USE_NET
 
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char *_STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char *_STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
 static httpd_handle_t http_server = NULL;
 
-static size_t jpg_encode_stream(void *arg, size_t index, const void *data, size_t len) {
-    jpg_chunking_t *j = (jpg_chunking_t *)arg;
-    if (!index) {
-        j->len = 0;
+static esp_err_t stream_handler(httpd_req_t *req) {
+    esp_err_t res = ESP_OK;
+    char *part_buf[64];
+
+    static int64_t last_frame = 0;
+
+    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+    if (res != ESP_OK) {
+        return res;
     }
-    if (httpd_resp_send_chunk(j->req, (const char *)data, len) != ESP_OK) {
-        return 0;
+
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    if (res == ESP_OK) {
+        res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
     }
-    j->len += len;
-    return len;
+
+    while (true) {
+        if (last_frame == _jpg_frame_number)
+            continue;
+        last_frame = _jpg_frame_number;
+        if (res == ESP_OK) {
+            size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
+            res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+        }
+        if (res == ESP_OK) {
+            res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+        }
+        if (res == ESP_OK) {
+            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+        }
+    }
+    return res;
 }
 
 static esp_err_t jpg_httpd_handler(httpd_req_t *req) {
-    camera_fb_t *fb = NULL;
     esp_err_t res = ESP_OK;
-    size_t fb_len = 0;
-    int64_t fr_start = esp_timer_get_time();
-
-    fb = esp_camera_fb_get();
-    if (!fb) {
-        ESP_LOGE(TAG, "Camera capture failed");
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
     res = httpd_resp_set_type(req, "image/jpeg");
     if (res == ESP_OK) {
         res = httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
     }
-
     if (res == ESP_OK) {
-        fb_len = fb->len;
-        res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+        res = httpd_resp_send(req, (const char *)_jpg_buf,_jpg_buf_len);
     }
-    esp_camera_fb_return(fb);
-    int64_t fr_end = esp_timer_get_time();
-    ESP_LOGI(TAG, "JPG: %uKB %ums", (uint32_t)(fb_len / 1024), (uint32_t)((fr_end - fr_start) / 1000));
     return res;
 }
 
@@ -290,6 +390,11 @@ httpd_uri_t uri_handler_jpg = {
     .uri = "/jpg",
     .method = HTTP_GET,
     .handler = jpg_httpd_handler};
+
+httpd_uri_t uri_handler_stream = {
+    .uri = "/",
+    .method = HTTP_GET,
+    .handler = stream_handler};
 
 void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -300,6 +405,7 @@ void start_webserver(void) {
         // Set URI handlers
         ESP_LOGI(TAG, "Registering URI handlers");
         httpd_register_uri_handler(http_server, &uri_handler_jpg);
+        httpd_register_uri_handler(http_server, &uri_handler_stream);
         return;
     }
 
@@ -377,8 +483,6 @@ static void initialise_wifi(void) {
         .sta = {
             .ssid = STRINGIFY(_WIFI_SSID),
             .password = STRINGIFY(_WIFI_PWD),
-            .threshold.authmode = WIFI_AUTH_WPA2_WPA3_PSK,
-            .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
         },
     };
     ESP_LOGI(TAG, "Setting WiFi configuration SSID %s...", wifi_config.sta.ssid);
@@ -408,18 +512,6 @@ static void initialise_wifi(void) {
 }
 #endif
 
-#ifdef USE_ILI9341_DRIVER
-static void tftlcd_task(void *arg)
-{
-    while(1)
-    {
-        camera_fb_t *pic = esp_camera_fb_get();
-        esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, pic->buf);
-        esp_camera_fb_return(pic);
-        vTaskDelay(100 / portTICK_RATE_MS);
-    }
-}
-#endif
 
 void app_main(void) {
 #if ESP_CAMERA_SUPPORTED
@@ -437,12 +529,14 @@ void app_main(void) {
 #endif
 
 #ifdef USE_ILI9341_DRIVER
+
+    for (int i = 0; i < 2; i++) {
+        s_lines[i] = heap_caps_malloc(LCD_H_RES * PARALLEL_LINES * sizeof(uint16_t), MALLOC_CAP_DMA);
+        assert(s_lines[i] != NULL);
+    }
     TaskHandle_t myTaskHandle = NULL;
-    xTaskCreate(tftlcd_task, "Tftlcd_task", 8192, NULL, 1, &myTaskHandle);
+    xTaskCreate(tftlcd_task, "Tftlcd_task", 4096, NULL, 1, &myTaskHandle);
 #endif
-
-
-
 #else
     ESP_LOGE(TAG, "Camera support is not available for this chip");
 #endif
